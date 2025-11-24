@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import matplotlib.pyplot as plt
 
@@ -42,37 +42,53 @@ def moving_average(values: List[float], window: int) -> List[float]:
     return smoothed
 
 
-def plot_metrics(
-    entries: List[Dict[str, float]],
-    metrics: List[str],
+def plot_metric(
+    metric: str,
+    runs: Sequence[Dict[str, object]],
     smooth: int,
-    output: Path | None,
+    output_dir: Path | None,
 ) -> None:
-    steps = [entry.get("step", idx + 1) for idx, entry in enumerate(entries)]
-    plt.figure(figsize=(10, 6))
-    for metric in metrics:
+    plt.figure(figsize=(10, 5))
+    for run in runs:
+        entries: List[Dict[str, float]] = run["entries"]  # type: ignore
+        steps = [entry.get("step", idx + 1) for idx, entry in enumerate(entries)]
         values = [entry.get(metric) for entry in entries]
         if any(v is None for v in values):
-            print(f"[WARN] Metric '{metric}' missing in some entries, skipping.")
+            print(f"[WARN] '{metric}' missing in some entries for run {run['label']}, skipping.")
             continue
         smoothed = moving_average(values, smooth)
-        plt.plot(steps, smoothed, label=f"{metric} (window={smooth})")
+        plt.plot(steps, smoothed, label=f"{run['label']} (window={smooth})")
+    plt.title(metric)
     plt.xlabel("Training Update")
-    plt.ylabel("Metric")
-    plt.legend()
+    plt.ylabel(metric)
     plt.grid(True, alpha=0.3)
+    plt.legend()
     plt.tight_layout()
-    if output:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(output, dpi=200)
-        print(f"Saved figure to {output}")
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = output_dir / f"{metric}.png"
+        plt.savefig(out_path, dpi=200)
+        print(f"Saved {out_path}")
+        plt.close()
     else:
         plt.show()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plot training metrics from JSON log.")
-    parser.add_argument("--log-file", type=Path, required=True, help="Path to train.log (JSON lines).")
+    parser = argparse.ArgumentParser(description="Plot metrics for multiple runs.")
+    parser.add_argument(
+        "--log-files",
+        type=Path,
+        nargs="+",
+        required=True,
+        help="One or more train.log paths (JSON lines).",
+    )
+    parser.add_argument(
+        "--labels",
+        type=str,
+        nargs="*",
+        help="Optional labels for each log file. Defaults to filename stem.",
+    )
     parser.add_argument(
         "--metrics",
         type=str,
@@ -80,12 +96,26 @@ def main() -> None:
         help="Comma-separated metric names to visualize.",
     )
     parser.add_argument("--smooth", type=int, default=10, help="Moving-average window size.")
-    parser.add_argument("--output", type=Path, default=None, help="Optional path to save the plot.")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="If provided, saves each metric figure to this directory.",
+    )
     args = parser.parse_args()
 
-    entries = load_log(args.log_file)
+    if args.labels and len(args.labels) != len(args.log_files):
+        raise ValueError("Number of labels must match number of log files.")
+
     metrics = [m.strip() for m in args.metrics.split(",") if m.strip()]
-    plot_metrics(entries, metrics, max(1, args.smooth), args.output)
+    runs = []
+    for idx, log_path in enumerate(args.log_files):
+        entries = load_log(log_path)
+        label = args.labels[idx] if args.labels else log_path.stem
+        runs.append({"label": label, "entries": entries})
+
+    for metric in metrics:
+        plot_metric(metric, runs, max(1, args.smooth), args.output_dir)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # Core deep learning stack
-torch>=2.0.0
+
 numpy>=1.23
 pyyaml>=6.0
 

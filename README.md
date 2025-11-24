@@ -66,14 +66,16 @@ torchrun --nproc_per_node=2 --master_port=29502 \
 
 ## 结果可视化
 
-训练日志为 JSON 行格式，位于 `runs/<algo>/train.log`。可用以下命令绘制曲线：
+训练日志为 JSON 行格式，位于 `runs/<algo>/train.log`。新版脚本支持在同一图中对比多个算法的同一指标，例如：
 ```bash
 python tools/plot_training.py \
-    --log-file runs/vita_noise/train.log \
+    --log-files runs/mappo_clean/train.log runs/vita_noise/train.log \
+    --labels MAPPO VITA \
     --metrics episode_reward,policy_loss,value_loss,kl,trust_loss \
     --smooth 20 \
-    --output figures/vita_noise.png
+    --output-dir figures/compare
 ```
+将分别生成 `figures/compare/episode_reward.png` 等文件，每张图展示相同指标下两条曲线；若省略 `--output-dir`，则在屏幕上逐个弹出。
 
 ## 配置说明
 
