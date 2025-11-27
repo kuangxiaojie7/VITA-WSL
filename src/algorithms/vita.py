@@ -290,7 +290,10 @@ class VITATrainer:
     def _schedule_coeff(update: int, warmup: int) -> float:
         if warmup <= 0:
             return 1.0
-        return min(1.0, max(0.0, update / float(warmup)))
+        if update <= warmup:
+            return 0.5 * max(0.0, update) / float(warmup)
+        extra = min(update - warmup, warmup)
+        return min(1.0, 0.5 + 0.5 * extra / float(warmup))
 
     def _initialize_history(self, obs: torch.Tensor) -> None:
         self.obs_history = deque(

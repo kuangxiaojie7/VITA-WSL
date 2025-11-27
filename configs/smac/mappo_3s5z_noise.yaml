@@ -1,5 +1,5 @@
 algorithm: mappo
-seed: 42
+seed: 1337
 cuda: true
 env:
   name: smac

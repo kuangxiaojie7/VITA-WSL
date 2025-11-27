@@ -10,12 +10,13 @@ env:
   packet_drop_prob: 0.1
   malicious_agent_prob: 0.05
 model:
-  hidden_dim: 192
-  latent_dim: 96
+  hidden_dim: 224
+  latent_dim: 112
   max_neighbors: 5
   trust_gamma: 1.5
   kl_beta: 0.0005
   trust_lambda: 0.15
+  comm_dropout: 0.1
   history_length: 4
 train:
   episode_length: 120
@@ -27,7 +28,7 @@ train:
   ppo_epochs: 5
   num_mini_batch: 4
   entropy_coef: 0.01
-  value_loss_coef: 0.5
+  value_loss_coef: 0.6
   max_grad_norm: 10.0
-  trust_warmup_updates: 300
-  kl_warmup_updates: 200
+  trust_warmup_updates: 400
+  kl_warmup_updates: 300

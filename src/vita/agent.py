@@ -21,6 +21,7 @@ class VITAAgentConfig:
     kl_beta: float = 1e-3
     trust_lambda: float = 0.1
     max_neighbors: int = 5
+    comm_dropout: float = 0.1
 
 
 class VITAAgent(torch.nn.Module):
@@ -32,6 +33,13 @@ class VITAAgent(torch.nn.Module):
         self.trust_predictor = TrustPredictor(cfg.hidden_dim, cfg.action_dim, cfg.trust_gamma)
         self.vib_gat = VIBGATLayer(cfg.hidden_dim, cfg.latent_dim, cfg.kl_beta)
         self.residual = GatedResidualBlock(cfg.hidden_dim)
+        self.neighbor_norm = torch.nn.LayerNorm(cfg.hidden_dim)
+        self.comm_dropout = torch.nn.Dropout(cfg.comm_dropout)
+        self.critic_mlp = torch.nn.Sequential(
+            torch.nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+        )
         self.policy_head = torch.nn.Linear(cfg.hidden_dim, cfg.action_dim)
         self.value_head = torch.nn.Linear(cfg.hidden_dim, 1)
 
@@ -44,6 +52,7 @@ class VITAAgent(torch.nn.Module):
         B, K, T, D = neighbor_seq.shape
         flat = neighbor_seq.view(B * K, T, D)
         feat, _ = self.actor_encoder(flat, None, None)
+        feat = self.neighbor_norm(feat)
         return feat.view(B, K, -1)
 
     def _mask_logits(self, logits: torch.Tensor, avail_actions: torch.Tensor | None) -> torch.Tensor:
@@ -71,6 +80,7 @@ class VITAAgent(torch.nn.Module):
         neighbor_feat = self._encode_neighbors(neighbor_seq)
         _, trust_mask = self.trust_predictor(neighbor_feat, neighbor_next_actions)
         comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_mask)
+        comm_feat = self.comm_dropout(comm_feat)
         fused = self.residual(self_feat, comm_feat)
         logits = self.policy_head(fused)
         logits = self._mask_logits(logits, avail_actions)
@@ -83,6 +93,7 @@ class VITAAgent(torch.nn.Module):
         entropy = dist.entropy().unsqueeze(-1)
 
         critic_feat, next_critic = self.critic_encoder(state.unsqueeze(1), rnn_states_critic.unsqueeze(0), masks)
+        critic_feat = self.critic_mlp(critic_feat)
         values = self.value_head(critic_feat)
 
         return {
@@ -111,6 +122,7 @@ class VITAAgent(torch.nn.Module):
         neighbor_feat = self._encode_neighbors(neighbor_seq)
         pred_actions, trust_mask = self.trust_predictor(neighbor_feat, neighbor_next_actions)
         comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_mask)
+        comm_feat = self.comm_dropout(comm_feat)
         fused = self.residual(self_feat, comm_feat)
         logits = self.policy_head(fused)
         logits = self._mask_logits(logits, avail_actions)
@@ -119,6 +131,7 @@ class VITAAgent(torch.nn.Module):
         entropy = dist.entropy().unsqueeze(-1)
 
         critic_feat, _ = self.critic_encoder(state.unsqueeze(1), rnn_states_critic.unsqueeze(0), masks)
+        critic_feat = self.critic_mlp(critic_feat)
         values = self.value_head(critic_feat)
         trust_loss = F.mse_loss(pred_actions, neighbor_next_actions)
 
@@ -137,5 +150,6 @@ class VITAAgent(torch.nn.Module):
         masks: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         critic_feat, next_state = self.critic_encoder(state.unsqueeze(1), rnn_states_critic.unsqueeze(0), masks)
+        critic_feat = self.critic_mlp(critic_feat)
         values = self.value_head(critic_feat)
         return values, next_state.squeeze(0)
