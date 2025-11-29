@@ -222,10 +222,14 @@ class VITATrainer:
             self._current_update - self.train_cfg.trust_delay_updates,
             self.train_cfg.trust_warmup_updates,
         )
+        if not self.agent.cfg.enable_trust:
+            trust_coeff = 0.0
         kl_coeff = self._schedule_coeff(
             self._current_update - self.train_cfg.kl_delay_updates,
             self.train_cfg.kl_warmup_updates,
         )
+        if not self.agent.cfg.enable_kl:
+            kl_coeff = 0.0
         for _ in range(self.train_cfg.ppo_epochs):
             for batch in self.buffer.mini_batch_generator(norm_adv, self.train_cfg.num_mini_batch):
                 obs_seq_batch = batch["obs_seq"]

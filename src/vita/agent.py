@@ -22,6 +22,8 @@ class VITAAgentConfig:
     trust_lambda: float = 0.1
     max_neighbors: int = 5
     comm_dropout: float = 0.1
+    enable_trust: bool = True
+    enable_kl: bool = True
 
 
 class VITAAgent(torch.nn.Module):
@@ -78,8 +80,13 @@ class VITAAgent(torch.nn.Module):
     ) -> Dict[str, torch.Tensor]:
         self_feat, next_actor = self.actor_encoder(obs_seq, rnn_states_actor.unsqueeze(0), masks)
         neighbor_feat = self._encode_neighbors(neighbor_seq)
-        _, trust_mask = self.trust_predictor(neighbor_feat, neighbor_next_actions)
+        if self.cfg.enable_trust:
+            _, trust_mask = self.trust_predictor(neighbor_feat, neighbor_next_actions)
+        else:
+            trust_mask = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
         comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_mask)
+        if not self.cfg.enable_kl:
+            kl_loss = torch.zeros(1, device=self_feat.device)
         comm_feat = self.comm_dropout(comm_feat)
         fused = self.residual(self_feat, comm_feat)
         logits = self.policy_head(fused)
@@ -120,8 +127,14 @@ class VITAAgent(torch.nn.Module):
     ) -> Dict[str, torch.Tensor]:
         self_feat, _ = self.actor_encoder(obs_seq, rnn_states_actor.unsqueeze(0), masks)
         neighbor_feat = self._encode_neighbors(neighbor_seq)
-        pred_actions, trust_mask = self.trust_predictor(neighbor_feat, neighbor_next_actions)
+        if self.cfg.enable_trust:
+            pred_actions, trust_mask = self.trust_predictor(neighbor_feat, neighbor_next_actions)
+        else:
+            trust_mask = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
+            pred_actions = neighbor_next_actions
         comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_mask)
+        if not self.cfg.enable_kl:
+            kl_loss = torch.zeros(1, device=self_feat.device)
         comm_feat = self.comm_dropout(comm_feat)
         fused = self.residual(self_feat, comm_feat)
         logits = self.policy_head(fused)
@@ -133,7 +146,10 @@ class VITAAgent(torch.nn.Module):
         critic_feat, _ = self.critic_encoder(state.unsqueeze(1), rnn_states_critic.unsqueeze(0), masks)
         critic_feat = self.critic_mlp(critic_feat)
         values = self.value_head(critic_feat)
-        trust_loss = F.mse_loss(pred_actions, neighbor_next_actions)
+        if self.cfg.enable_trust:
+            trust_loss = F.mse_loss(pred_actions, neighbor_next_actions)
+        else:
+            trust_loss = torch.zeros(1, device=obs_seq.device)
 
         return {
             "log_probs": log_probs,
