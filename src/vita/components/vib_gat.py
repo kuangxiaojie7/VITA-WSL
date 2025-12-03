@@ -11,8 +11,10 @@ class VIBGATLayer(nn.Module):
 
     def __init__(self, hidden_dim: int, latent_dim: int, kl_beta: float):
         super().__init__()
+        self.pre_norm = nn.LayerNorm(hidden_dim)
         self.to_mu = nn.Linear(hidden_dim, latent_dim)
         self.to_logvar = nn.Linear(hidden_dim, latent_dim)
+        self.post_norm = nn.LayerNorm(latent_dim)
         self.query_proj = nn.Linear(hidden_dim, latent_dim)
         self.key_proj = nn.Linear(latent_dim, latent_dim)
         self.value_proj = nn.Linear(latent_dim, latent_dim)
@@ -31,11 +33,13 @@ class VIBGATLayer(nn.Module):
             neighbor_feat: [B, K, hidden_dim]
             trust_mask: [B, K, 1]
         """
-        mu = self.to_mu(neighbor_feat)
-        logvar = self.to_logvar(neighbor_feat)
+        norm_neighbors = self.pre_norm(neighbor_feat)
+        mu = self.to_mu(norm_neighbors)
+        logvar = self.to_logvar(norm_neighbors)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         z = mu + eps * std
+        z = self.post_norm(z)
 
         query = self.query_proj(self_feat).unsqueeze(1)
         keys = self.key_proj(z)

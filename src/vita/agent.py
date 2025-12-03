@@ -44,6 +44,17 @@ class VITAAgent(torch.nn.Module):
         )
         self.policy_head = torch.nn.Linear(cfg.hidden_dim, cfg.action_dim)
         self.value_head = torch.nn.Linear(cfg.hidden_dim, 1)
+        self.comm_enabled = True
+        self.comm_strength = 0.0
+
+    def set_comm_enabled(self, enabled: bool) -> None:
+        self.comm_enabled = enabled
+        if not enabled:
+            self.comm_strength = 0.0
+
+    def set_comm_strength(self, strength: float) -> None:
+        strength = float(max(0.0, min(1.0, strength)))
+        self.comm_strength = strength
 
     @property
     def rnn_hidden_dim(self) -> int:
@@ -89,7 +100,7 @@ class VITAAgent(torch.nn.Module):
         if not self.cfg.enable_kl:
             kl_loss = torch.zeros(1, device=self_feat.device)
         comm_feat = self.comm_dropout(comm_feat)
-        fused = self.residual(self_feat, comm_feat)
+        fused = self.residual(self_feat, comm_feat, self.comm_enabled, self.comm_strength)
         logits = self.policy_head(fused)
         logits = self._mask_logits(logits, avail_actions)
         dist = Categorical(logits=logits)
@@ -138,7 +149,7 @@ class VITAAgent(torch.nn.Module):
         if not self.cfg.enable_kl:
             kl_loss = torch.zeros(1, device=self_feat.device)
         comm_feat = self.comm_dropout(comm_feat)
-        fused = self.residual(self_feat, comm_feat)
+        fused = self.residual(self_feat, comm_feat, self.comm_enabled, self.comm_strength)
         logits = self.policy_head(fused)
         logits = self._mask_logits(logits, avail_actions)
         dist = Categorical(logits=logits)

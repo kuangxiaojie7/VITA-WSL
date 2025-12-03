@@ -29,6 +29,8 @@ class VITATrainParams:
     kl_warmup_updates: int = 0
     trust_delay_updates: int = 0
     kl_delay_updates: int = 0
+    comm_delay_updates: int = 0
+    comm_warmup_updates: int = 0
 
 
 class VITATrainer:
@@ -48,10 +50,10 @@ class VITATrainer:
         self.obs_dim = env.obs_dim
         self.state_dim = env.state_dim
         self.action_dim = env.action_dim
-        self.max_neighbors = min(policy_cfg.get("max_neighbors", self.num_agents - 1), self.num_agents - 1)
-        self.max_neighbors = max(1, self.max_neighbors)
+        self.max_neighbors = self.num_agents - 1 if self.num_agents > 1 else 1
         self.history_length = policy_cfg.get("history_length", 4)
         self.train_cfg = VITATrainParams(**train_cfg)
+        self._neighbor_template = self._build_neighbor_template()
 
         agent_cfg = VITAAgentConfig(
             obs_dim=self.obs_dim,
@@ -65,6 +67,8 @@ class VITATrainer:
             max_neighbors=self.max_neighbors,
         )
         self.agent = VITAAgent(agent_cfg).to(device)
+        self.agent.set_comm_enabled(False)
+        self.agent.set_comm_strength(0.0)
         self.optimizer = torch.optim.Adam(self.agent.parameters(), lr=self.train_cfg.lr, eps=1e-8)
         self.buffer = MAPPOBuffer(
             self.train_cfg.episode_length,
@@ -95,6 +99,10 @@ class VITATrainer:
 
         for update in range(1, self.train_cfg.updates + 1):
             self._current_update = update
+            comm_elapsed = self._current_update - self.train_cfg.comm_delay_updates
+            comm_coeff = self._schedule_coeff(comm_elapsed, self.train_cfg.comm_warmup_updates)
+            self.agent.set_comm_strength(comm_coeff)
+            self.agent.set_comm_enabled(comm_coeff > 0.0)
             self.buffer.reset(obs, state, actor_states, critic_states)
             reward_sum = 0.0
             for step in range(self.train_cfg.episode_length):
@@ -302,13 +310,12 @@ class VITATrainer:
         }
 
     @staticmethod
-    def _schedule_coeff(update: int, warmup: int) -> float:
+    def _schedule_coeff(elapsed: int, warmup: int) -> float:
+        if elapsed <= 0:
+            return 0.0
         if warmup <= 0:
-            return 0.0 if update <= 0 else 1.0
-        if update <= warmup:
-            return 0.5 * max(0.0, update) / float(warmup)
-        extra = min(update - warmup, warmup)
-        return min(1.0, 0.5 + 0.5 * extra / float(warmup))
+            return 1.0
+        return min(1.0, elapsed / float(warmup))
 
     def _initialize_history(self, obs: torch.Tensor) -> None:
         self.obs_history = deque(
@@ -323,6 +330,19 @@ class VITATrainer:
         assert self.obs_history is not None
         history = torch.stack(list(self.obs_history), dim=0)  # [T, envs, agents, obs_dim]
         return history.permute(1, 2, 0, 3).contiguous()
+
+    def _build_neighbor_template(self) -> torch.Tensor:
+        template = []
+        for agent_idx in range(self.num_agents):
+            candidates = [j for j in range(self.num_agents) if j != agent_idx]
+            if not candidates:
+                candidates = [agent_idx]
+            if len(candidates) >= self.max_neighbors:
+                template.append(candidates[: self.max_neighbors])
+            else:
+                pad = candidates[-1]
+                template.append(candidates + [pad] * (self.max_neighbors - len(candidates)))
+        return torch.tensor(template, dtype=torch.long)
 
     @property
     def _current_win_rate(self) -> float:
@@ -345,14 +365,9 @@ class VITATrainer:
 
     def _select_topk_neighbors(self, obs_seq: torch.Tensor) -> torch.Tensor:
         # obs_seq: [envs, agents, history, obs_dim]
-        latest = obs_seq[:, :, -1, :]
-        if self.num_agents == 1:
-            return torch.zeros(obs_seq.size(0), 1, 1, dtype=torch.long, device=obs_seq.device)
-        dist = torch.cdist(latest, latest, p=2)
-        mask = torch.eye(self.num_agents, device=dist.device).unsqueeze(0)
-        dist = dist + mask * 1e9
-        topk = torch.topk(dist, k=self.max_neighbors, dim=-1, largest=False).indices
-        return topk
+        envs = obs_seq.size(0)
+        template = self._neighbor_template.to(obs_seq.device)
+        return template.unsqueeze(0).expand(envs, -1, -1)
 
     def _gather_neighbor_sequences(
         self, obs_seq: torch.Tensor, neighbor_idx: torch.Tensor
