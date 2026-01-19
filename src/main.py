@@ -3,20 +3,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import torch
-
-from src.algorithms import MAPPOTrainer, VITATrainer
-from src.envs import make_smac_env
-from src.utils import Logger, load_config, set_seed
-
-
-def build_trainer(name: str, env, cfg, logger: Logger, device: torch.device):
-    name = name.lower()
-    if name == "mappo":
-        return MAPPOTrainer(env, cfg["model"], cfg["train"], logger, device)
-    if name == "vita":
-        return VITATrainer(env, cfg["model"], cfg["train"], logger, device)
-    raise ValueError(f"Unsupported algorithm: {name}")
+from src.algorithms.onpolicy_baseline import run_onpolicy_smac
+from src.utils import load_config, set_seed
 
 
 def main() -> None:
@@ -26,25 +14,16 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    seed = cfg.get("seed", 42)
+    seed = int(cfg.get("seed", 42))
     set_seed(seed)
 
-    algo_name = cfg.get("algorithm", "mappo")
-    env_name = cfg.get("env", {}).get("name", "smac")
+    algo_name = str(cfg.get("algorithm", "mappo")).lower()
+    env_name = str(cfg.get("env", {}).get("name", "smac")).lower()
     if env_name != "smac":
         raise ValueError("Only SMAC environments are currently supported.")
 
-    device = torch.device("cuda" if torch.cuda.is_available() and cfg.get("cuda", True) else "cpu")
-    env = make_smac_env(cfg["env"])
-    log_dir = Path(args.log_dir) / algo_name
-    logger = Logger(log_dir)
-
-    trainer = build_trainer(algo_name, env, cfg, logger, device)
-    try:
-        trainer.train()
-    finally:
-        env.close()
-        logger.close()
+    run_dir = Path(args.log_dir) / str(algo_name)
+    run_onpolicy_smac(cfg, config_path=Path(args.config), run_dir=run_dir)
 
 
 if __name__ == "__main__":
