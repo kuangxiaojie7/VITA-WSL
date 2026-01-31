@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
-import torch
-from torch.distributions import Categorical
-import torch.nn.functional as F
+import math
 
-from .components import FeatureEncoder, TrustPredictor, VIBGATLayer, GatedResidualBlock
+import torch
+import torch.nn.functional as F
+from torch.distributions import Categorical
+
+from .components import FeatureEncoder, VIBGATLayer, GatedResidualBlock, TrustPredictor
 
 
 @dataclass
@@ -19,14 +21,15 @@ class VITAAgentConfig:
     latent_dim: int = 64
     trust_gamma: float = 1.0
     kl_beta: float = 1e-3
+    kl_free_bits: float = 0.0
     trust_lambda: float = 0.1
+    trust_malicious_weight: float = 1.0
     max_neighbors: int = 5
     comm_dropout: float = 0.1
     enable_trust: bool = True
     enable_kl: bool = True
     vib_deterministic: bool = False
-    trust_threshold: float = 0.0
-    trust_keep_ratio: float = 1.0
+    trust_gate_floor: float = 0.0
     attn_bias_coef: float = 1.0
 
 
@@ -38,7 +41,13 @@ class VITAAgent(torch.nn.Module):
         self.critic_encoder = FeatureEncoder(cfg.state_dim, cfg.hidden_dim)
         self.comm_encoder = FeatureEncoder(cfg.obs_dim, cfg.hidden_dim)
         self.trust_predictor = TrustPredictor(cfg.hidden_dim, cfg.action_dim, cfg.trust_gamma)
-        self.vib_gat = VIBGATLayer(cfg.hidden_dim, cfg.latent_dim, cfg.kl_beta, cfg.attn_bias_coef)
+        self.vib_gat = VIBGATLayer(
+            cfg.hidden_dim,
+            cfg.latent_dim,
+            cfg.kl_beta,
+            cfg.attn_bias_coef,
+            cfg.kl_free_bits,
+        )
         self.residual = GatedResidualBlock(cfg.hidden_dim)
         self.neighbor_norm = torch.nn.LayerNorm(cfg.hidden_dim)
         self.comm_dropout = torch.nn.Dropout(cfg.comm_dropout)
@@ -55,6 +64,12 @@ class VITAAgent(torch.nn.Module):
         self.comm_enabled = True
         self.comm_strength = 0.0
         self.trust_strength = 0.0
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        has_trust = any(key.startswith("trust_predictor.") for key in state_dict)
+        if not has_trust:
+            return super().load_state_dict(state_dict, strict=False)
+        return super().load_state_dict(state_dict, strict=strict)
 
     def set_comm_enabled(self, enabled: bool) -> None:
         self.comm_enabled = enabled
@@ -85,16 +100,68 @@ class VITAAgent(torch.nn.Module):
         flat = neighbor_seq.view(B * K, T, D)
         feat, _ = self.comm_encoder(flat, None, None)
         feat = self.neighbor_norm(feat)
+        feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
         return feat.view(B, K, -1)
 
     def _mask_logits(self, logits: torch.Tensor, avail_actions: torch.Tensor | None) -> torch.Tensor:
+        logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e9, neginf=-1e9)
         if avail_actions is None:
             return logits
+        avail_actions = torch.nan_to_num(avail_actions, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+        logits = logits + (avail_actions * 1e-6)
         mask = (avail_actions < 0.5)
         all_masked = mask.all(dim=-1, keepdim=True)
         if all_masked.any():
-            mask = mask & (~all_masked)
+            # Ensure at least one action remains valid per row.
+            idx = torch.argmax(avail_actions, dim=-1, keepdim=True)
+            mask = mask.clone()
+            mask.scatter_(dim=-1, index=idx, value=False)
         return logits.masked_fill(mask, -1e9)
+
+    def _predict_trust(
+        self,
+        neighbor_feat: torch.Tensor,
+        neighbor_next_actions: torch.Tensor | None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits, trust = self.trust_predictor(neighbor_feat, neighbor_next_actions)
+        trust = torch.nan_to_num(trust, nan=1.0, posinf=1.0, neginf=1.0)
+        return logits, trust.clamp(min=1e-6, max=1.0)
+
+    def _trust_loss(
+        self,
+        trust_logits: torch.Tensor,
+        trust_scores: torch.Tensor | None,
+        neighbor_next_actions: torch.Tensor | None,
+        neighbor_mask: torch.Tensor | None = None,
+        neighbor_malicious: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if neighbor_next_actions is None:
+            return torch.zeros(1, device=trust_logits.device)
+        has_label = neighbor_next_actions.sum(dim=-1, keepdim=True) > 1e-6
+        if not bool(has_label.any()):
+            return torch.zeros(1, device=trust_logits.device)
+        log_probs = F.log_softmax(trust_logits, dim=-1)
+        ce = -(neighbor_next_actions * log_probs).sum(dim=-1, keepdim=True)
+        ce = torch.nan_to_num(ce, nan=0.0, posinf=0.0, neginf=0.0)
+        denom = math.log(max(int(trust_logits.size(-1)), 2))
+        ce = ce / denom
+        valid = has_label
+        if neighbor_mask is not None:
+            valid = valid & (neighbor_mask > 0.5)
+        base_loss = (ce * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+        aux_loss = torch.zeros(1, device=trust_logits.device)
+        if neighbor_malicious is not None and trust_scores is not None:
+            sup_mask = torch.ones_like(trust_scores, dtype=torch.bool)
+            if neighbor_mask is not None:
+                sup_mask = sup_mask & (neighbor_mask > 0.5)
+            if bool(sup_mask.any()):
+                target = (1.0 - neighbor_malicious).clamp(0.0, 1.0)
+                trust_scores = torch.nan_to_num(trust_scores, nan=1.0, posinf=1.0, neginf=1.0)
+                trust_scores = trust_scores.clamp(1e-6, 1.0 - 1e-6)
+                bce = F.binary_cross_entropy(trust_scores, target, reduction="none")
+                aux_loss = (bce * sup_mask.float()).sum() / sup_mask.float().sum().clamp_min(1.0)
+        weight = float(getattr(self.cfg, "trust_malicious_weight", 1.0))
+        return base_loss + weight * aux_loss
 
     def act(
         self,
@@ -110,6 +177,7 @@ class VITAAgent(torch.nn.Module):
         deterministic: bool = False,
     ) -> Dict[str, torch.Tensor]:
         self_feat, next_actor = self.actor_encoder(obs_seq, rnn_states_actor.unsqueeze(0), masks)
+        self_feat = torch.nan_to_num(self_feat, nan=0.0, posinf=0.0, neginf=0.0)
         if (not self.comm_enabled) or (self.comm_strength <= 0.0):
             comm_feat = torch.zeros_like(self_feat)
             kl_loss = torch.zeros(1, device=self_feat.device)
@@ -119,51 +187,22 @@ class VITAAgent(torch.nn.Module):
             if neighbor_mask is None:
                 neighbor_mask = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
             comm_mask = neighbor_mask.float()
-            use_trust = self.cfg.enable_trust and (self.trust_strength > 0.0)
+            comm_mask = torch.nan_to_num(comm_mask, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+            neighbor_feat = torch.nan_to_num(neighbor_feat, nan=0.0, posinf=0.0, neginf=0.0)
+            use_trust = self.cfg.enable_trust
             if use_trust:
-                _, trust_scores_raw = self.trust_predictor(neighbor_feat, neighbor_next_actions)
-                trust_scores = (1.0 - float(self.trust_strength)) + float(self.trust_strength) * trust_scores_raw.detach()
+                _, trust_scores = self._predict_trust(neighbor_feat, neighbor_next_actions)
+                trust_scores = trust_scores.detach()
+                trust_scores = (1.0 - float(self.trust_strength)) + float(self.trust_strength) * trust_scores
             else:
-                trust_scores_raw = None
                 trust_scores = torch.ones_like(comm_mask)
-            if use_trust and (self.cfg.trust_threshold > 0.0 or self.cfg.trust_keep_ratio < 1.0):
-                valid_mask = (neighbor_mask > 0.5).squeeze(-1)
-                trust_values = trust_scores.squeeze(-1)
-
-                keep_ratio_target = float(max(0.0, min(1.0, float(self.cfg.trust_keep_ratio))))
-                strength = float(max(0.0, min(1.0, float(self.trust_strength))))
-                keep_ratio = 1.0 - strength * (1.0 - keep_ratio_target)
-
-                min_trust = float(max(0.0, min(1.0, float(self.cfg.trust_threshold))))
-                threshold = torch.full(
-                    (trust_values.size(0),),
-                    min_trust,
-                    device=trust_values.device,
-                    dtype=trust_values.dtype,
-                )
-                if keep_ratio < 1.0:
-                    scores = trust_values.masked_fill(~valid_mask, -1e9)
-                    sorted_scores, _ = scores.sort(dim=1, descending=True)
-                    n_valid = valid_mask.sum(dim=1).to(dtype=torch.float32)
-                    keep_count = torch.ceil(n_valid * float(keep_ratio)).to(dtype=torch.long).clamp(min=1)
-                    idx = (keep_count - 1).clamp(min=0, max=sorted_scores.size(1) - 1)
-                    kth = sorted_scores[torch.arange(sorted_scores.size(0), device=sorted_scores.device), idx]
-                    threshold = torch.maximum(threshold, kth)
-
-                trust_gate_hard = ((trust_values >= threshold[:, None]) & valid_mask).float().unsqueeze(-1)
-                kept = trust_gate_hard.sum(dim=1, keepdim=True)
-                has_valid = valid_mask.sum(dim=1, keepdim=True).unsqueeze(-1) > 0.5
-                need_fallback = (kept < 0.5) & has_valid
-                scores = trust_values.masked_fill(~valid_mask, -1e9)
-                best = scores.argmax(dim=1)
-                fallback = torch.zeros_like(trust_gate_hard)
-                fallback[torch.arange(best.size(0), device=best.device), best, 0] = 1.0
-                trust_gate_hard = torch.where(need_fallback, fallback, trust_gate_hard)
-                trust_gate_soft = trust_scores.clamp(min=0.0, max=1.0)
-                trust_gate = (1.0 - strength) * trust_gate_soft + strength * trust_gate_hard
-                comm_mask = comm_mask * trust_gate
+            trust_gate_soft = trust_scores.clamp(min=0.0, max=1.0)
+            gate_floor = float(max(0.0, min(1.0, float(self.cfg.trust_gate_floor))))
+            if gate_floor > 0.0:
+                trust_gate_soft = gate_floor + (1.0 - gate_floor) * trust_gate_soft
+            comm_mask = comm_mask * trust_gate_soft
             neighbor_feat = neighbor_feat * comm_mask
-            trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
+            trust_scores = trust_scores * neighbor_mask + (1e-6 * (1.0 - neighbor_mask))
             vib_deterministic = bool(deterministic) or bool(self.cfg.vib_deterministic)
             comm_feat, kl_loss, kl_raw = self.vib_gat(
                 self_feat,
@@ -173,6 +212,9 @@ class VITAAgent(torch.nn.Module):
                 alive_mask=comm_mask,
                 deterministic=vib_deterministic,
             )
+            comm_feat = torch.nan_to_num(comm_feat, nan=0.0, posinf=0.0, neginf=0.0)
+            kl_loss = torch.nan_to_num(kl_loss, nan=0.0, posinf=0.0, neginf=0.0)
+            kl_raw = torch.nan_to_num(kl_raw, nan=0.0, posinf=0.0, neginf=0.0)
             if not self.cfg.enable_kl:
                 kl_loss = torch.zeros(1, device=self_feat.device)
             comm_feat = self.comm_dropout(comm_feat)
@@ -209,6 +251,7 @@ class VITAAgent(torch.nn.Module):
         neighbor_seq: torch.Tensor,
         neighbor_mask: torch.Tensor | None,
         neighbor_next_actions: torch.Tensor,
+        neighbor_malicious: torch.Tensor | None,
         actions: torch.Tensor,
         rnn_states_actor: torch.Tensor,
         rnn_states_critic: torch.Tensor,
@@ -216,11 +259,12 @@ class VITAAgent(torch.nn.Module):
         avail_actions: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         self_feat, next_actor = self.actor_encoder(obs_seq, rnn_states_actor.unsqueeze(0), masks)
+        self_feat = torch.nan_to_num(self_feat, nan=0.0, posinf=0.0, neginf=0.0)
         if (not self.comm_enabled) or (self.comm_strength <= 0.0):
             comm_feat = torch.zeros_like(self_feat)
             kl_loss = torch.zeros(1, device=self_feat.device)
-            trust_loss = torch.zeros(1, device=obs_seq.device)
             kl_raw = torch.zeros(1, device=self_feat.device)
+            trust_loss = torch.zeros(1, device=obs_seq.device)
             trust_score_mean = torch.zeros(1, device=obs_seq.device)
             trust_score_p10 = torch.zeros(1, device=obs_seq.device)
             trust_score_p50 = torch.zeros(1, device=obs_seq.device)
@@ -228,58 +272,39 @@ class VITAAgent(torch.nn.Module):
             trust_gate_ratio = torch.zeros(1, device=obs_seq.device)
             comm_valid_neighbors = torch.zeros(1, device=obs_seq.device)
             comm_kept_neighbors = torch.zeros(1, device=obs_seq.device)
+            comm_malicious_ratio = torch.zeros(1, device=obs_seq.device)
+            trust_malicious_gap = torch.zeros(1, device=obs_seq.device)
         else:
             neighbor_feat = self._encode_neighbors(neighbor_seq)
             if neighbor_mask is None:
                 neighbor_mask = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
             comm_mask = neighbor_mask.float()
-            use_trust = self.cfg.enable_trust and (self.trust_strength > 0.0)
+            comm_mask = torch.nan_to_num(comm_mask, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+            neighbor_feat = torch.nan_to_num(neighbor_feat, nan=0.0, posinf=0.0, neginf=0.0)
+            trust_loss = torch.zeros(1, device=obs_seq.device)
+            trust_scores_raw = None
+            use_trust = self.cfg.enable_trust
             if use_trust:
-                # Decouple trust supervision from comm encoder gradients.
-                pred_actions, trust_scores_raw = self.trust_predictor(neighbor_feat.detach(), neighbor_next_actions)
-                trust_scores = (1.0 - float(self.trust_strength)) + float(self.trust_strength) * trust_scores_raw.detach()
+                trust_logits, trust_scores_raw = self._predict_trust(neighbor_feat, neighbor_next_actions)
+                trust_loss = self._trust_loss(
+                    trust_logits,
+                    trust_scores_raw,
+                    neighbor_next_actions,
+                    neighbor_mask=neighbor_mask,
+                    neighbor_malicious=neighbor_malicious,
+                )
+                trust_scores_raw = trust_scores_raw.detach()
+                trust_scores = (1.0 - float(self.trust_strength)) + float(self.trust_strength) * trust_scores_raw
             else:
                 trust_scores = torch.ones_like(comm_mask)
                 trust_scores_raw = None
-                pred_actions = neighbor_next_actions
-            if use_trust and (self.cfg.trust_threshold > 0.0 or self.cfg.trust_keep_ratio < 1.0):
-                valid_mask = (neighbor_mask > 0.5).squeeze(-1)
-                trust_values = trust_scores.squeeze(-1)
-
-                keep_ratio_target = float(max(0.0, min(1.0, float(self.cfg.trust_keep_ratio))))
-                strength = float(max(0.0, min(1.0, float(self.trust_strength))))
-                keep_ratio = 1.0 - strength * (1.0 - keep_ratio_target)
-
-                min_trust = float(max(0.0, min(1.0, float(self.cfg.trust_threshold))))
-                threshold = torch.full(
-                    (trust_values.size(0),),
-                    min_trust,
-                    device=trust_values.device,
-                    dtype=trust_values.dtype,
-                )
-                if keep_ratio < 1.0:
-                    scores = trust_values.masked_fill(~valid_mask, -1e9)
-                    sorted_scores, _ = scores.sort(dim=1, descending=True)
-                    n_valid = valid_mask.sum(dim=1).to(dtype=torch.float32)
-                    keep_count = torch.ceil(n_valid * float(keep_ratio)).to(dtype=torch.long).clamp(min=1)
-                    idx = (keep_count - 1).clamp(min=0, max=sorted_scores.size(1) - 1)
-                    kth = sorted_scores[torch.arange(sorted_scores.size(0), device=sorted_scores.device), idx]
-                    threshold = torch.maximum(threshold, kth)
-
-                trust_gate_hard = ((trust_values >= threshold[:, None]) & valid_mask).float().unsqueeze(-1)
-                kept = trust_gate_hard.sum(dim=1, keepdim=True)
-                has_valid = valid_mask.sum(dim=1, keepdim=True).unsqueeze(-1) > 0.5
-                need_fallback = (kept < 0.5) & has_valid
-                scores = trust_values.masked_fill(~valid_mask, -1e9)
-                best = scores.argmax(dim=1)
-                fallback = torch.zeros_like(trust_gate_hard)
-                fallback[torch.arange(best.size(0), device=best.device), best, 0] = 1.0
-                trust_gate_hard = torch.where(need_fallback, fallback, trust_gate_hard)
-                trust_gate_soft = trust_scores.clamp(min=0.0, max=1.0)
-                trust_gate = (1.0 - strength) * trust_gate_soft + strength * trust_gate_hard
-                comm_mask = comm_mask * trust_gate
+            trust_gate_soft = trust_scores.clamp(min=0.0, max=1.0)
+            gate_floor = float(max(0.0, min(1.0, float(self.cfg.trust_gate_floor))))
+            if gate_floor > 0.0:
+                trust_gate_soft = gate_floor + (1.0 - gate_floor) * trust_gate_soft
+            comm_mask = comm_mask * trust_gate_soft
             neighbor_feat = neighbor_feat * comm_mask
-            trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
+            trust_scores = trust_scores * neighbor_mask + (1e-6 * (1.0 - neighbor_mask))
             vib_deterministic = bool(self.cfg.vib_deterministic)
             comm_feat, kl_loss, kl_raw = self.vib_gat(
                 self_feat,
@@ -289,23 +314,19 @@ class VITAAgent(torch.nn.Module):
                 alive_mask=comm_mask,
                 deterministic=vib_deterministic,
             )
+            comm_feat = torch.nan_to_num(comm_feat, nan=0.0, posinf=0.0, neginf=0.0)
+            kl_loss = torch.nan_to_num(kl_loss, nan=0.0, posinf=0.0, neginf=0.0)
+            kl_raw = torch.nan_to_num(kl_raw, nan=0.0, posinf=0.0, neginf=0.0)
             # Align KL penalty strength with how much communication is used in the residual fusion.
             kl_loss = kl_loss * float(self.comm_strength)
             if not self.cfg.enable_kl:
                 kl_loss = torch.zeros(1, device=self_feat.device)
             comm_feat = self.comm_dropout(comm_feat)
-            if use_trust:
-                has_label = neighbor_next_actions.sum(dim=-1, keepdim=True) > 1e-6
-                valid = ((neighbor_mask > 0.5) & has_label).float()
-                se = (pred_actions - neighbor_next_actions).pow(2).sum(dim=-1, keepdim=True)
-                trust_loss = (se * valid).sum() / valid.sum().clamp_min(1.0)
-            else:
-                trust_loss = torch.zeros(1, device=obs_seq.device)
 
             # Trust diagnostics (computed on valid neighbor slots before comm dropout).
             valid_mask = (neighbor_mask > 0.5).squeeze(-1)
             comm_valid_neighbors = valid_mask.float().sum(dim=-1).mean()
-            comm_kept_neighbors = (comm_mask > 0.5).squeeze(-1).float().sum(dim=-1).mean()
+            comm_kept_neighbors = comm_mask.squeeze(-1).sum(dim=-1).mean()
             trust_values = (trust_scores_raw if trust_scores_raw is not None else trust_scores).squeeze(-1)[valid_mask]
             if trust_values.numel() == 0:
                 trust_score_mean = torch.zeros(1, device=obs_seq.device)
@@ -320,8 +341,24 @@ class VITAAgent(torch.nn.Module):
                 trust_score_p10 = qv[0]
                 trust_score_p50 = qv[1]
                 trust_score_p90 = qv[2]
-                kept = (comm_mask > 0.5).squeeze(-1)[valid_mask].float().sum()
+                kept = comm_mask.squeeze(-1)[valid_mask].sum()
                 trust_gate_ratio = kept / valid_mask.float().sum().clamp_min(1.0)
+            comm_malicious_ratio = torch.zeros(1, device=obs_seq.device)
+            trust_malicious_gap = torch.zeros(1, device=obs_seq.device)
+            if neighbor_malicious is not None and trust_scores_raw is not None:
+                mal_mask = (neighbor_malicious > 0.5).squeeze(-1) & valid_mask
+                if bool(valid_mask.any()):
+                    comm_malicious_ratio = mal_mask.float().sum() / valid_mask.float().sum().clamp_min(1.0)
+                if bool(mal_mask.any()):
+                    trust_mal = trust_scores_raw.squeeze(-1)[mal_mask].mean()
+                else:
+                    trust_mal = torch.zeros(1, device=obs_seq.device)
+                clean_mask = valid_mask & (~mal_mask)
+                if bool(clean_mask.any()):
+                    trust_clean = trust_scores_raw.squeeze(-1)[clean_mask].mean()
+                else:
+                    trust_clean = torch.zeros(1, device=obs_seq.device)
+                trust_malicious_gap = trust_clean - trust_mal
         fused = self.residual(self_feat, comm_feat, self.comm_enabled, self.comm_strength)
         if (not self.comm_enabled) or (self.comm_strength <= 0.0):
             residual_gate_mean = torch.zeros(1, device=obs_seq.device)
@@ -361,7 +398,10 @@ class VITAAgent(torch.nn.Module):
             "trust_gate_ratio": trust_gate_ratio,
             "comm_valid_neighbors": comm_valid_neighbors,
             "comm_kept_neighbors": comm_kept_neighbors,
+            "comm_malicious_ratio": comm_malicious_ratio,
+            "trust_malicious_gap": trust_malicious_gap,
             "comm_strength": torch.tensor(float(self.comm_strength), device=obs_seq.device),
+            "trust_strength": torch.tensor(float(self.trust_strength), device=obs_seq.device),
             "comm_enabled": torch.tensor(float(self.comm_enabled), device=obs_seq.device),
             "residual_gate_mean": residual_gate_mean,
             "residual_gate_max": residual_gate_max,

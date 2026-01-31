@@ -7,6 +7,22 @@ from typing import Dict, List, Sequence
 
 import matplotlib.pyplot as plt
 
+METRIC_ALIASES = {
+    "uncertainty_score_mean": "trust_score_mean",
+    "uncertainty_score_p10": "trust_score_p10",
+    "uncertainty_score_p50": "trust_score_p50",
+    "uncertainty_score_p90": "trust_score_p90",
+    "uncertainty_gate_ratio": "trust_gate_ratio",
+}
+
+METRIC_DISPLAY_NAMES = {
+    "trust_score_mean": "uncertainty_score_mean",
+    "trust_score_p10": "uncertainty_score_p10",
+    "trust_score_p50": "uncertainty_score_p50",
+    "trust_score_p90": "uncertainty_score_p90",
+    "trust_gate_ratio": "uncertainty_gate_ratio",
+}
+
 
 def load_log(path: Path) -> List[Dict[str, float]]:
     data: List[Dict[str, float]] = []
@@ -42,7 +58,7 @@ def moving_average(values: List[float], window: int) -> List[float]:
     return values
 
 
-def _format_axes(metric: str, args) -> None:
+def _format_axes(metric: str, display_name: str, args) -> None:
     if args.winrate_style and "win_rate" in metric:
         plt.xlabel("T (mil)")
         plt.ylabel("Test Win Rate%")
@@ -50,7 +66,7 @@ def _format_axes(metric: str, args) -> None:
         plt.xlim(left=0)
     else:
         plt.xlabel("Training Update")
-        plt.ylabel(metric)
+        plt.ylabel(display_name)
 
 
 def plot_metric(
@@ -60,6 +76,9 @@ def plot_metric(
     output_dir: Path | None,
     args,
 ) -> None:
+    metric_key = METRIC_ALIASES.get(metric, metric)
+    display_name = METRIC_DISPLAY_NAMES.get(metric_key, metric)
+
     plt.figure(figsize=(10, 5))
     if args.winrate_style:
         plt.gca().set_facecolor("#f9f9f9")
@@ -75,12 +94,20 @@ def plot_metric(
                     phase = "eval" if any(k.startswith("eval_") for k in entry.keys()) else "train"
                 if phase != args.phase:
                     continue
-            val = entry.get(metric)
+            val = entry.get(metric_key)
             if val is None:
                 continue
-            step_val = entry.get("step", idx + 1)
+            if args.x_axis == "total_env_steps":
+                step_val = entry.get("total_env_steps")
+                if step_val is None:
+                    step_val = entry.get("step", idx + 1)
+            else:
+                step_val = entry.get("step", idx + 1)
             if args.winrate_style and "win_rate" in metric:
-                step_val = step_val * args.timesteps_per_update / 1e6
+                if args.x_axis == "total_env_steps":
+                    step_val = step_val / 1e6
+                else:
+                    step_val = step_val * args.timesteps_per_update / 1e6
                 val = val * 100.0
             filtered_steps.append(step_val)
             filtered_values.append(val)
@@ -89,7 +116,7 @@ def plot_metric(
             filtered_steps.insert(0, 0.0)
             filtered_values.insert(0, 0.0)
         if not filtered_values:
-            print(f"[WARN] '{metric}' not present for run {run['label']}, skipping.")
+            print(f"[WARN] '{metric_key}' not present for run {run['label']}, skipping.")
             continue
         # For win-rate plots, left-pad zeros to let smoothing start from origin smoothly.
         if args.winrate_style and "win_rate" in metric and smooth > 1:
@@ -116,15 +143,15 @@ def plot_metric(
         )[0]
         if args.winrate_style and not args.no_fill:
             plt.fill_between(x_vals, smoothed, alpha=args.fill_alpha, color=line.get_color())
-    plt.title(args.title or metric)
-    _format_axes(metric, args)
+    plt.title(args.title or display_name)
+    _format_axes(metric_key, display_name, args)
     if not args.winrate_style:
         plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
-        out_path = output_dir / f"{metric}.png"
+        out_path = output_dir / f"{display_name}.png"
         plt.savefig(out_path, dpi=200)
         print(f"Saved {out_path}")
         plt.close()
@@ -193,6 +220,13 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Environment timesteps represented by one training update (used when --winrate-style).",
+    )
+    parser.add_argument(
+        "--x-axis",
+        type=str,
+        choices=["step", "total_env_steps"],
+        default="step",
+        help="X axis source: step or total_env_steps.",
     )
     parser.add_argument(
         "--no-fill",

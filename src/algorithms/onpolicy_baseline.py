@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import os
 import sys
+import json
+import time
+import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -117,10 +121,11 @@ def build_onpolicy_smac_args(cfg: Dict[str, Any], *, config_path: Path) -> List[
         args += ["--vita_latent_dim", str(_as_int(model_cfg.get("latent_dim", 64), name="model.latent_dim"))]
         args += ["--vita_trust_gamma", str(_as_float(model_cfg.get("trust_gamma", 1.0), name="model.trust_gamma"))]
         args += ["--vita_kl_beta", str(_as_float(model_cfg.get("kl_beta", 1e-3), name="model.kl_beta"))]
+        args += ["--vita_kl_free_bits", str(_as_float(model_cfg.get("kl_free_bits", 0.0), name="model.kl_free_bits"))]
         args += ["--vita_attn_bias_coef", str(_as_float(model_cfg.get("attn_bias_coef", 1.0), name="model.attn_bias_coef"))]
         args += ["--vita_trust_lambda", str(_as_float(model_cfg.get("trust_lambda", 0.1), name="model.trust_lambda"))]
-        args += ["--vita_trust_threshold", str(_as_float(model_cfg.get("trust_threshold", 0.0), name="model.trust_threshold"))]
-        args += ["--vita_trust_keep_ratio", str(_as_float(model_cfg.get("trust_keep_ratio", 1.0), name="model.trust_keep_ratio"))]
+        args += ["--vita_trust_malicious_weight", str(_as_float(model_cfg.get("trust_malicious_weight", 1.0), name="model.trust_malicious_weight"))]
+        args += ["--vita_trust_gate_floor", str(_as_float(model_cfg.get("trust_gate_floor", 0.0), name="model.trust_gate_floor"))]
         args += ["--vita_comm_dropout", str(_as_float(model_cfg.get("comm_dropout", 0.1), name="model.comm_dropout"))]
         args += ["--vita_comm_sight_range", str(_as_float(model_cfg.get("comm_sight_range", 0.0), name="model.comm_sight_range"))]
         args += ["--vita_max_neighbors", str(_as_int(model_cfg.get("max_neighbors", 4), name="model.max_neighbors"))]
@@ -168,6 +173,51 @@ def build_onpolicy_smac_args(cfg: Dict[str, Any], *, config_path: Path) -> List[
     return args
 
 
+def _write_run_snapshot(run_dir: Path, config_path: Path, args: list[str]) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    config_dst = run_dir / "config.yaml"
+    if config_dst.exists():
+        config_dst = run_dir / f"config_{timestamp}.yaml"
+    try:
+        shutil.copy2(config_path, config_dst)
+    except FileNotFoundError:
+        config_dst = None
+
+    args_dst = run_dir / "args.json"
+    if args_dst.exists():
+        args_dst = run_dir / f"args_{timestamp}.json"
+
+    args_payload = {"argv": args, "config_path": str(config_path)}
+    try:
+        from onpolicy.config import get_config
+        from onpolicy.scripts.train import train_smac
+
+        parser = get_config()
+        all_args = train_smac.parse_args(args, parser)
+        args_payload["parsed"] = vars(all_args)
+    except Exception:
+        pass
+
+    with args_dst.open("w", encoding="utf-8") as f:
+        json.dump(args_payload, f, ensure_ascii=False, indent=2)
+
+    try:
+        log_path = run_dir / "train.log"
+        meta = {
+            "time": time.time(),
+            "phase": "meta",
+            "config_path": str(config_path),
+            "config_snapshot": str(config_dst) if config_dst is not None else None,
+            "args_snapshot": str(args_dst),
+        }
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def run_onpolicy_smac(cfg: Dict[str, Any], *, config_path: Path, run_dir: Path) -> None:
     """Run the upstream on-policy SMAC trainer (external/on-policy).
 
@@ -184,6 +234,7 @@ def run_onpolicy_smac(cfg: Dict[str, Any], *, config_path: Path, run_dir: Path) 
     os.environ["ONPOLICY_PACKET_DROP_PROB"] = str(float(env_cfg.get("packet_drop_prob", 0.0)))
     os.environ["ONPOLICY_MALICIOUS_AGENT_PROB"] = str(float(env_cfg.get("malicious_agent_prob", 0.0)))
     os.environ["ONPOLICY_MALICIOUS_OBS_NOISE_SCALE"] = str(float(env_cfg.get("malicious_obs_noise_scale", 3.0)))
+    os.environ["ONPOLICY_MALICIOUS_OBS_MODE"] = str(env_cfg.get("malicious_obs_mode", "replace"))
     os.environ["ONPOLICY_NOISE_WARMUP_STEPS"] = str(int(env_cfg.get("noise_warmup_steps", 0)))
     os.environ["ONPOLICY_COMM_NOISE_STD"] = str(float(env_cfg.get("comm_noise_std", 0.0)))
     os.environ["ONPOLICY_COMM_PACKET_DROP_PROB"] = str(float(env_cfg.get("comm_packet_drop_prob", 0.0)))
@@ -194,6 +245,8 @@ def run_onpolicy_smac(cfg: Dict[str, Any], *, config_path: Path, run_dir: Path) 
     os.environ["ONPOLICY_REWARD_MULT"] = str(float(env_cfg.get("reward_scale", 1.0)))
 
     args = build_onpolicy_smac_args(cfg, config_path=config_path)
+
+    _write_run_snapshot(run_dir, config_path, args)
 
     from onpolicy.scripts.train import train_smac
 

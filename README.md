@@ -92,7 +92,7 @@ python tools/plot_training.py \
 
 ## MAPPO vs. VITA
 
-- **架构**：VITA 在局部编码后串联自监督信任预测、变分信息瓶颈 GAT 与门控残差，并结合视距掩码 + `trust_threshold` 做通信裁剪；MAPPO 仅使用常规集中式 actor-critic。
+- **架构**：VITA 在局部编码后串联自监督信任预测、变分信息瓶颈 GAT 与门控残差，并结合视距掩码 + 软信任门控做通信裁剪；MAPPO 仅使用常规集中式 actor-critic。
 - **损失/调度**：VITA 的 PPO 目标额外包含 KL 与信任监督，可分别通过 `enable_kl`/`enable_trust` 与延迟-warmup 调度控制生效时机，对噪声/恶意代理更鲁棒。
 - **数据处理**：VITA 的 rollout buffer 记录邻居观测序列、邻居动作序列以及 Top-K 邻居索引，供信任模块学习；MAPPO 只消费单步观测。
 

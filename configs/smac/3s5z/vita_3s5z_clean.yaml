@@ -17,8 +17,6 @@ model:
   kl_beta: 0.0001
   attn_bias_coef: 0.75
   trust_lambda: 0.08
-  trust_threshold: 0.25
-  trust_keep_ratio: 1.0
   comm_dropout: 0.1
   enable_trust: true
   enable_kl: true

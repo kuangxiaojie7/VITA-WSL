@@ -3,15 +3,31 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
+import math
 import torch.nn as nn
 
 
 class VIBGATLayer(nn.Module):
-    def __init__(self, hidden_dim: int, latent_dim: int, kl_beta: float, bias_coef: float):
+    def __init__(
+        self,
+        hidden_dim: int,
+        latent_dim: int,
+        kl_beta: float,
+        bias_coef: float,
+        kl_free_bits: float = 0.0,
+    ):
         super().__init__()
         self.pre_norm = nn.LayerNorm(hidden_dim)
-        self.to_mu = nn.Linear(hidden_dim, latent_dim)
-        self.to_logvar = nn.Linear(hidden_dim, latent_dim)
+        self.to_mu = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self.to_logvar = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
         self.post_norm = nn.LayerNorm(latent_dim)
         self.query_proj = nn.Linear(hidden_dim, latent_dim)
         self.key_proj = nn.Linear(latent_dim, latent_dim)
@@ -24,6 +40,9 @@ class VIBGATLayer(nn.Module):
         )
         self.bias_coef = bias_coef
         self.kl_beta = kl_beta
+        self.kl_free_bits = float(kl_free_bits)
+        self.logvar_min = -8.0
+        self.logvar_max = 4.0
 
     def forward(
         self,
@@ -36,9 +55,12 @@ class VIBGATLayer(nn.Module):
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     
+        neighbor_feat = torch.nan_to_num(neighbor_feat, nan=0.0, posinf=0.0, neginf=0.0)
         norm_neighbors = self.pre_norm(neighbor_feat)
+        norm_neighbors = torch.nan_to_num(norm_neighbors, nan=0.0, posinf=0.0, neginf=0.0)
         mu = self.to_mu(norm_neighbors)
         logvar = self.to_logvar(norm_neighbors)
+        logvar = logvar.clamp(min=self.logvar_min, max=self.logvar_max)
         if deterministic:
             z = mu
         else:
@@ -61,7 +83,7 @@ class VIBGATLayer(nn.Module):
         trust_term = torch.log(trust_mask.squeeze(-1) + 1e-6)
         attn_logits = attn_logits + trust_term
         neighbor_mask = comm_mask.squeeze(-1)
-        attn_logits = attn_logits.masked_fill(neighbor_mask < 0.5, -1e9)
+        attn_logits = attn_logits.masked_fill(neighbor_mask < 1e-6, -1e9)
         attn_weights = torch.softmax(attn_logits, dim=-1)
         attn_weights = attn_weights * neighbor_mask
         norm = attn_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -74,5 +96,10 @@ class VIBGATLayer(nn.Module):
         edge_mask = comm_mask.squeeze(-1)
         denom = edge_mask.sum().clamp_min(1.0)
         kl_raw = (kl_per_edge * edge_mask).sum() / denom
-        kl_scaled = self.kl_beta * kl_raw
+        kl_raw = kl_raw / math.log(2.0)
+        if self.kl_free_bits > 0.0:
+            kl_for_loss = torch.clamp(kl_raw, min=self.kl_free_bits)
+        else:
+            kl_for_loss = kl_raw
+        kl_scaled = self.kl_beta * kl_for_loss
         return comm_feat, kl_scaled, kl_raw

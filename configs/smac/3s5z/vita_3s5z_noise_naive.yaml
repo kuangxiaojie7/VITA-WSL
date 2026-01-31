@@ -24,8 +24,6 @@ model:
   enable_trust: false
   enable_kl: false
   vib_deterministic: true
-  trust_threshold: 0.0
-  trust_keep_ratio: 1.0
   comm_sight_range: 999
   max_neighbors: 7
   history_length: 1

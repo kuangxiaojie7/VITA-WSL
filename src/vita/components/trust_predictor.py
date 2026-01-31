@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Tuple
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,7 +40,11 @@ class TrustPredictor(nn.Module):
             trust = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
         else:
             has_label = neighbor_next_action.sum(dim=-1, keepdim=True) > 1e-6
-            mse = F.mse_loss(logits, neighbor_next_action, reduction="none").mean(dim=-1, keepdim=True)
-            trust = torch.exp(-self.gamma * mse)
+            log_probs = F.log_softmax(logits, dim=-1)
+            ce = -(neighbor_next_action * log_probs).sum(dim=-1, keepdim=True)
+            denom = math.log(max(int(logits.size(-1)), 2))
+            ce = ce / denom
+            trust = torch.exp(-self.gamma * ce)
             trust = torch.where(has_label, trust, torch.ones_like(trust))
+        trust = torch.nan_to_num(trust, nan=1.0, posinf=1.0, neginf=1.0)
         return logits, trust

@@ -1,0 +1,6 @@
+__pycache__
+summary
+checkpoints
+datasets/MNIST
+
+experiments.py
